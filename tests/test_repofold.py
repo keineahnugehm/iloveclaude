@@ -1,11 +1,15 @@
 import shutil
 import subprocess
+import sys
+import types
 
 import pytest
 
-from ctxpack import collect, redact, render_markdown, render_tree, render_xml
-from ctxpack.cli import apply_budget, main, parse_size
-from ctxpack.collect import FileEntry, _ignored, _parse_gitignore
+import repofold.cli
+from repofold import collect, redact, render_markdown, render_tree, render_xml
+from repofold.cli import apply_budget, main, parse_size
+from repofold.collect import FileEntry, _ignored, _parse_gitignore
+from repofold.watch import watch
 
 
 def write(root, rel, content="x\n"):
@@ -155,6 +159,13 @@ def test_markdown_fence_survives_backticks_in_content():
     assert out.rstrip().endswith("````")
 
 
+def test_tree_only_header_has_no_token_count():
+    files = [FileEntry("a.py", "x = 1\n")]
+    assert "1 file · packed with repofold" in render_markdown("demo", files, tree_only=True)
+    assert "approx_tokens" not in render_xml("demo", files, tree_only=True)
+    assert "1 file · ~2 tokens" in render_markdown("demo", files)
+
+
 def test_xml_output_escapes_attributes():
     out = render_xml("demo", [FileEntry('we"ird.py', "x = 1\n")])
     assert '<file path="we&quot;ird.py">\nx = 1\n</file>' in out
@@ -205,3 +216,142 @@ def test_cli_stdout_and_dry_run(tmp_path, capsys):
 def test_cli_rejects_missing_directory(tmp_path, capsys):
     assert main([str(tmp_path / "nope")]) == 2
     assert "not a directory" in capsys.readouterr().err
+
+
+def test_cli_rejects_non_positive_interval(tmp_path, capsys):
+    assert main([str(tmp_path), "-n", "--interval", "0"]) == 2
+    assert "--interval" in capsys.readouterr().err
+
+
+# --- exact token counts ----------------------------------------------------------
+
+
+def install_fake_anthropic(monkeypatch, *, tokens=4321, error=None):
+    """Stand-in for the SDK so tests need neither the package nor an API key."""
+    mod = types.ModuleType("anthropic")
+
+    class AnthropicError(Exception):
+        pass
+
+    class APIConnectionError(AnthropicError):
+        pass
+
+    class APIStatusError(AnthropicError):
+        def __init__(self, message, status_code=500):
+            super().__init__(message)
+            self.message = message
+            self.status_code = status_code
+
+    class AuthenticationError(APIStatusError):
+        pass
+
+    class NotFoundError(APIStatusError):
+        pass
+
+    calls = []
+
+    class Messages:
+        def count_tokens(self, **kwargs):
+            calls.append(kwargs)
+            if error == "missing-credentials":
+                # What the real SDK raises when no key or profile is configured.
+                raise TypeError('"Could not resolve authentication method. Expected one of '
+                                'api_key, auth_token, or credentials to be set."')
+            if error:
+                raise getattr(mod, error)("boom")
+            return types.SimpleNamespace(input_tokens=tokens)
+
+    class Anthropic:
+        def __init__(self):
+            self.messages = Messages()
+
+    for cls in (AnthropicError, APIConnectionError, APIStatusError, AuthenticationError,
+                NotFoundError, Anthropic):
+        setattr(mod, cls.__name__, cls)
+    monkeypatch.setitem(sys.modules, "anthropic", mod)
+    return calls
+
+
+def test_exact_token_count(tmp_path, monkeypatch, capsys):
+    calls = install_fake_anthropic(monkeypatch, tokens=4321)
+    write(tmp_path, "app.py", "print('hi')\n")
+
+    assert main([str(tmp_path), "-n", "--exact"]) == 0
+    assert "4,321 (exact, claude-opus-5-5)" in capsys.readouterr().err
+    assert calls[0]["model"] == "claude-opus-5-5"
+    assert "print('hi')" in calls[0]["messages"][0]["content"]
+
+
+def test_exact_token_count_with_bad_credentials(tmp_path, monkeypatch, capsys):
+    install_fake_anthropic(monkeypatch, error="AuthenticationError")
+    write(tmp_path, "app.py")
+
+    assert main([str(tmp_path), "-n", "--exact", "--model", "claude-sonnet-5-5"]) == 1
+    err = capsys.readouterr().err
+    assert "ANTHROPIC_API_KEY" in err
+    assert "~" in err  # falls back to the estimate
+
+
+def test_exact_token_count_without_credentials(tmp_path, monkeypatch, capsys):
+    install_fake_anthropic(monkeypatch, error="missing-credentials")
+    write(tmp_path, "app.py")
+
+    assert main([str(tmp_path), "-n", "--exact"]) == 1
+    assert "no Anthropic credentials found" in capsys.readouterr().err
+
+
+def test_exact_token_count_without_sdk(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # makes `import anthropic` fail
+    write(tmp_path, "app.py")
+
+    assert main([str(tmp_path), "-n", "-q", "--exact"]) == 1
+    assert "pip install 'repofold[claude]'" in capsys.readouterr().err
+
+
+# --- watch mode -----------------------------------------------------------------
+
+
+def test_watch_reacts_to_changes(tmp_path):
+    target = write(tmp_path, "a.py", "a = 1\n")
+    changes, sleeps = [], []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            target.write_text("a = 1\nb = 2\n", encoding="utf-8")
+
+    watch(tmp_path, lambda: changes.append(1), sleep=fake_sleep, max_polls=3)
+    assert changes == [1]
+
+
+def test_watch_ignores_output_file_and_git_dir(tmp_path):
+    out = tmp_path / "packed.md"
+    write(tmp_path, "a.py")
+    changes, counter = [], [0]
+
+    def fake_sleep(seconds):
+        counter[0] += 1
+        write(tmp_path, "packed.md", "x" * counter[0])
+        write(tmp_path, ".git/index", "y" * counter[0])
+
+    watch(tmp_path, lambda: changes.append(1), ignore=[out], sleep=fake_sleep, max_polls=3)
+    assert changes == []
+
+
+def test_cli_watch_repacks_on_change(tmp_path, monkeypatch, capsys):
+    write(tmp_path, "a.py", "a = 1\n")
+    out = tmp_path / "packed.md"
+    seen = {}
+
+    def fake_watch(root, on_change, *, interval, ignore):
+        seen["ignore"] = ignore
+        write(tmp_path, "b.py", "b = 2\n")
+        on_change()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(repofold.cli, "watch", fake_watch)
+    assert main([str(tmp_path), "-o", str(out), "--watch"]) == 0
+    assert seen["ignore"] == [out]
+    assert "### b.py" in out.read_text(encoding="utf-8")
+    err = capsys.readouterr().err
+    assert "watching" in err and "change detected" in err

@@ -1,0 +1,24 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead?
+      placeholder: "repofold -f xml ... printed ... but I expected ..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How can we reproduce it?
+      description: A minimal file layout or .gitignore that triggers the problem helps a lot. Please don't paste secrets.
+  - type: input
+    id: version
+    attributes:
+      label: Version and platform
+      placeholder: "repofold 0.1.0, Python 3.12, macOS 15"
+    validations:
+      required: true

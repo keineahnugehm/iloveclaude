@@ -1,4 +1,4 @@
-"""ctxpack: pack a codebase into one LLM-ready prompt."""
+"""repofold: pack a codebase into one LLM-ready prompt."""
 
 from .collect import Collection, FileEntry, collect
 from .redact import redact

@@ -59,6 +59,10 @@ def render_tree(paths: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
 def _fence(content: str) -> str:
     longest = max((len(m) for m in re.findall(r"`+", content)), default=0)
     return "`" * max(3, longest + 1)
@@ -66,11 +70,14 @@ def _fence(content: str) -> str:
 
 def render_markdown(name: str, files: list[FileEntry], *, tree_only: bool = False) -> str:
     paths = [f.path for f in files]
-    total = sum(estimate_tokens(f.content) for f in files)
+    stats = f"{_count(len(files), 'file')} · packed with repofold"
+    if not tree_only:
+        total = sum(estimate_tokens(f.content) for f in files)
+        stats = f"{_count(len(files), 'file')} · ~{total:,} tokens · packed with repofold"
     out = [
         f"# {name}",
         "",
-        f"{len(files)} files · ~{total:,} tokens · packed with ctxpack",
+        stats,
         "",
         "## Directory structure",
         "",
@@ -89,9 +96,11 @@ def render_markdown(name: str, files: list[FileEntry], *, tree_only: bool = Fals
 
 def render_xml(name: str, files: list[FileEntry], *, tree_only: bool = False) -> str:
     paths = [f.path for f in files]
-    total = sum(estimate_tokens(f.content) for f in files)
+    attrs = f'name="{html.escape(name)}" files="{len(files)}"'
+    if not tree_only:
+        attrs += f' approx_tokens="{sum(estimate_tokens(f.content) for f in files)}"'
     out = [
-        f'<repository name="{html.escape(name)}" files="{len(files)}" approx_tokens="{total}">',
+        f"<repository {attrs}>",
         "<directory_structure>",
         render_tree(paths),
         "</directory_structure>",

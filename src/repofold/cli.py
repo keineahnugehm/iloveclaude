@@ -1,4 +1,4 @@
-"""Command-line interface for ctxpack."""
+"""Command-line interface for repofold."""
 
 from __future__ import annotations
 
@@ -8,12 +8,16 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
-from .collect import collect
+from .claude import DEFAULT_MODEL, TokenCountError, count_tokens
+from .collect import Collection, FileEntry, collect
 from .redact import redact
 from .render import RENDERERS, estimate_tokens
+from .watch import watch
 
 EXTENSIONS = {"markdown": "md", "xml": "xml"}
 
@@ -28,14 +32,16 @@ def parse_size(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="ctxpack",
+        prog="repofold",
         description="Pack a codebase into a single LLM-ready prompt.",
         epilog="examples:\n"
-               "  ctxpack                      pack the current directory\n"
-               "  ctxpack -c                   ...and copy it to the clipboard\n"
-               "  ctxpack src -i '*.py'        only Python files under src/\n"
-               "  ctxpack --max-tokens 100k    stay inside a token budget\n"
-               "  ctxpack -n                   just show what would be packed",
+               "  repofold                      pack the current directory\n"
+               "  repofold -c                   ...and copy it to the clipboard\n"
+               "  repofold src -i '*.py'        only Python files under src/\n"
+               "  repofold --max-tokens 100k    stay inside a token budget\n"
+               "  repofold -n                   just show what would be packed\n"
+               "  repofold -n --exact           ...with an exact Claude token count\n"
+               "  repofold -w -o ctx.md         keep ctx.md up to date while you work",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("path", nargs="?", default=".", help="project directory (default: .)")
@@ -55,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tree-only", action="store_true", help="only output the directory tree")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="print the summary without producing output")
+    p.add_argument("--exact", action="store_true",
+                   help="count tokens exactly with the Anthropic API; sends the packed text "
+                        "to Anthropic (needs repofold[claude] and an API key)")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help=f"model for --exact (default: {DEFAULT_MODEL})")
+    p.add_argument("-w", "--watch", action="store_true",
+                   help="re-pack whenever a file changes (Ctrl+C to stop)")
+    p.add_argument("--interval", type=float, default=1.0, metavar="SECONDS",
+                   help="how often --watch checks for changes (default: 1)")
     p.add_argument("--top", type=int, default=5, metavar="N",
                    help="list the N largest files in the summary (default: 5)")
     p.add_argument("--no-gitignore", action="store_true", help="ignore .gitignore rules")
@@ -62,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also pack lockfiles, build output and credential files")
     p.add_argument("--no-redact", action="store_true", help="don't redact detected secrets")
     p.add_argument("-q", "--quiet", action="store_true", help="no summary on stderr")
-    p.add_argument("-V", "--version", action="version", version=f"ctxpack {__version__}")
+    p.add_argument("-V", "--version", action="version", version=f"repofold {__version__}")
     return p
 
 
@@ -102,18 +117,19 @@ def apply_budget(files, budget: int):
     return kept, dropped
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    root = Path(args.path)
-    if not root.is_dir():
-        print(f"ctxpack: not a directory: {root}", file=sys.stderr)
-        return 2
+@dataclass
+class Packed:
+    name: str
+    result: Collection
+    files: list[FileEntry]
+    dropped: list[str]
+    redactions: dict[str, int]
+    text: str
+    exact_tokens: int | None = None
+    token_error: str | None = None
 
-    to_stdout = args.stdout or (not args.output and not args.copy and not sys.stdout.isatty())
-    output = Path(args.output) if args.output else None
-    if not output and not args.copy and not to_stdout and not args.dry_run:
-        output = Path(f"ctxpack-output.{EXTENSIONS[args.format]}")
 
+def pack(args: argparse.Namespace, root: Path, output: Path | None) -> Packed:
     result = collect(
         root,
         include=args.include,
@@ -137,33 +153,85 @@ def main(argv: list[str] | None = None) -> int:
 
     name = result.root.name or str(result.root)
     text = RENDERERS[args.format](name, files, tree_only=args.tree_only)
+    packed = Packed(name, result, files, dropped, redactions, text)
+    if args.exact:
+        try:
+            packed.exact_tokens = count_tokens(text, args.model)
+        except TokenCountError as exc:
+            packed.token_error = str(exc)
+    return packed
 
-    if not args.dry_run:
-        if output:
-            with open(output, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
-        if args.copy:
-            try:
-                copy_to_clipboard(text)
-            except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
-                print(f"ctxpack: could not copy to clipboard: {exc}", file=sys.stderr)
-                return 1
-        if to_stdout:
-            # Pipes on Windows default to a legacy code page that can't encode the tree.
-            try:
-                sys.stdout.reconfigure(encoding="utf-8")
-            except (AttributeError, ValueError):
-                pass
-            sys.stdout.write(text)
 
-    if not args.quiet:
-        _print_summary(args, name, result, files, dropped, redactions, text, output, to_stdout)
+def emit(args: argparse.Namespace, packed: Packed, output: Path | None, to_stdout: bool) -> int:
+    if args.dry_run:
+        return 0
+    if output:
+        with open(output, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(packed.text)
+    if args.copy:
+        try:
+            copy_to_clipboard(packed.text)
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            print(f"repofold: could not copy to clipboard: {exc}", file=sys.stderr)
+            return 1
+    if to_stdout:
+        # Pipes on Windows default to a legacy code page that can't encode the tree.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        sys.stdout.write(packed.text)
+        sys.stdout.flush()
     return 0
 
 
-def _print_summary(args, name, result, files, dropped, redactions, text, output, to_stdout):
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    root = Path(args.path)
+    if not root.is_dir():
+        print(f"repofold: not a directory: {root}", file=sys.stderr)
+        return 2
+    if args.interval <= 0:
+        print("repofold: --interval must be positive", file=sys.stderr)
+        return 2
+
+    to_stdout = args.stdout or (not args.output and not args.copy and not sys.stdout.isatty())
+    output = Path(args.output) if args.output else None
+    if not output and not args.copy and not to_stdout and not args.dry_run:
+        output = Path(f"repofold-output.{EXTENSIONS[args.format]}")
+
+    def run_once() -> int:
+        packed = pack(args, root, output)
+        status = emit(args, packed, output, to_stdout)
+        if not args.quiet:
+            _print_summary(args, packed, output, to_stdout)
+        elif packed.token_error:
+            print(f"repofold: exact token count failed: {packed.token_error}", file=sys.stderr)
+        return status or (1 if packed.token_error else 0)
+
+    status = run_once()
+    if not args.watch:
+        return status
+
+    def rerun() -> None:
+        if not args.quiet:
+            print(f"\n↻ {time.strftime('%H:%M:%S')} change detected", file=sys.stderr)
+        run_once()
+
+    if not args.quiet:
+        print(f"\nwatching {root.resolve()} for changes (Ctrl+C to stop)", file=sys.stderr)
+    try:
+        watch(root, rerun, interval=args.interval, ignore=[output] if output else [])
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _print_summary(args: argparse.Namespace, packed: Packed, output: Path | None,
+                   to_stdout: bool) -> None:
     s = _Style(sys.stderr)
-    lines = [f"{s('ctxpack', '1')} · {name}"]
+    result, files = packed.result, packed.files
+    lines = [f"{s('repofold', '1')} · {packed.name}"]
 
     skipped = []
     if result.skipped_binary:
@@ -171,22 +239,30 @@ def _print_summary(args, name, result, files, dropped, redactions, text, output,
     if result.skipped_large:
         skipped.append(f"{len(result.skipped_large)} too large")
     if result.skipped_secret_files:
-        skipped.append(f"{len(result.skipped_secret_files)} credential files")
-    if dropped:
-        skipped.append(f"{len(dropped)} over budget")
+        n = len(result.skipped_secret_files)
+        skipped.append(f"{n} credential file{'' if n == 1 else 's'}")
+    if packed.dropped:
+        skipped.append(f"{len(packed.dropped)} over budget")
     detail = f" ({', '.join(skipped)} skipped)" if skipped else ""
     lines.append(f"  {s('files', '2')}     {len(files)} included{detail}")
 
-    lines.append(f"  {s('tokens', '2')}    ~{estimate_tokens(text):,}")
-    if redactions:
-        kinds = ", ".join(f"{k}×{n}" for k, n in sorted(redactions.items()))
-        total = sum(redactions.values())
+    if packed.exact_tokens is not None:
+        tokens = f"{packed.exact_tokens:,} (exact, {args.model})"
+    else:
+        tokens = f"~{estimate_tokens(packed.text):,}"
+        if packed.token_error:
+            tokens += f"  {s('exact count failed: ' + packed.token_error, '31')}"
+    lines.append(f"  {s('tokens', '2')}    {tokens}")
+    if packed.redactions:
+        kinds = ", ".join(f"{k}×{n}" for k, n in sorted(packed.redactions.items()))
+        total = sum(packed.redactions.values())
         lines.append(f"  {s('redacted', '2')}  {s(f'{total} secret(s)', '33')}: {kinds}")
     if args.top > 0 and files:
         largest = sorted(files, key=lambda f: len(f.content), reverse=True)[: args.top]
         lines.append(f"  {s('largest', '2')}")
         for f in largest:
-            lines.append(f"    ~{estimate_tokens(f.content):>8,}  {f.path}")
+            approx = f"~{estimate_tokens(f.content):,}"
+            lines.append(f"    {approx:>9}  {f.path}")
 
     if args.dry_run:
         dest = "nothing written (dry run)"
